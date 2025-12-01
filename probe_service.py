@@ -11,21 +11,19 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 import websockets
+import paramiko
 
 status = {}
 lock = threading.Lock()
 
 def ping_ip(ip, timeout_sec):
     try:
-        # 检查操作系统类型，使用不同的ping命令参数
         import platform
         system = platform.system().lower()
         
         if system == "windows":
-            # Windows系统使用-n参数指定发送次数，-w指定超时时间(毫秒)
             cmd = ["ping", "-n", "1", "-w", str(timeout_sec * 1000), ip]
         else:
-            # Linux/Unix系统使用-c参数指定发送次数，-W指定超时时间(秒)
             cmd = ["ping", "-c", "1", "-W", str(timeout_sec), ip]
             
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
@@ -34,11 +32,9 @@ def ping_ip(ip, timeout_sec):
         out = p.stdout or ""
         for line in out.splitlines():
             if "time=" in line or "time<" in line or "时间=" in line:
-                # Windows中文系统可能显示"时间="<数字>"ms
                 m = re.search(r"time[=<]([0-9.]+)\s*ms|时间[=<]([0-9.]+)\s*ms", line)
                 if m:
                     try:
-                        # 提取匹配到的数字
                         latency = float(m.group(1) if m.group(1) else m.group(2))
                     except Exception:
                         latency = None
@@ -99,6 +95,8 @@ async def handle_terminal(websocket):
         username = init_data.get('user', 'root')
         password = init_data.get('password') or 'Databuff@123'
         cols = int(init_data.get('cols', 120))
+        import base64
+        import os
         rows = int(init_data.get('rows', 40))
 
         print(f"尝试SSH连接到 {ip}:{port} 用户: {username} (终端尺寸: {cols}x{rows})")
@@ -162,7 +160,7 @@ async def handle_terminal(websocket):
                         import base64
                         encoded_data = base64.b64encode(data).decode('ascii')
                         await websocket.send(json.dumps({"type": "data", "data": encoded_data}))
-                    except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed:
                         print("WebSocket连接已关闭，停止发送数据")
                         break
                     except Exception as send_error:
@@ -175,9 +173,11 @@ async def handle_terminal(websocket):
 
         async def websocket_to_terminal():
             try:
+                # 保存上传会话状态: upload_id -> {temp_path, filename, remote_path, received}
+                upload_states = {}
                 async for message in websocket:
                     try:
-                        message_data = json.loads(message)
+                    message_data = json.loads(message)
                     except json.JSONDecodeError as e:
                         print(f"JSON解析错误: {e}")
                         continue
@@ -211,12 +211,158 @@ async def handle_terminal(websocket):
                             print(f"终端已调整大小: {cols}x{rows}")
                         except ValueError as e:
                             print(f"终端大小参数无效: {e}")
-                        except Exception as e:
+                            except Exception as e:
                             print(f"调整终端大小失败: {e}")
                     elif message_data.get('type') == 'disconnect':
                         # 处理断开连接请求
                         print("客户端请求断开连接")
                         return
+                    elif message_data.get('type') == 'upload-init':
+                        # 初始化一次上传会话，创建临时文件并记录状态
+                        try:
+                            import uuid, tempfile
+                            upload_id = message_data.get('upload_id') or str(uuid.uuid4())
+                            filename = message_data.get('filename', 'file.bin')
+                            total = int(message_data.get('size', 0))
+                            remote_path = message_data.get('remote_path', '/tmp') or '/tmp'
+
+                            fd, temp_file = tempfile.mkstemp(prefix='ws_upload_')
+                            os.close(fd)
+                            # 初始化状态
+                            upload_states[upload_id] = {
+                                'temp_path': temp_file,
+                                'filename': filename,
+                                'remote_path': remote_path,
+                                'received': 0,
+                                'total': total
+                            }
+                            await websocket.send(json.dumps({'type': 'upload-ack', 'upload_id': upload_id, 'status': 'ready'}))
+                            print(f'upload-init: {upload_id} -> {temp_file} (remote: {remote_path})')
+                        except Exception as e:
+                            print(f'upload-init failed: {e}')
+                            try:
+                                await websocket.send(json.dumps({'type': 'error', 'message': f'upload-init failed: {str(e)}'}))
+                            except:
+                                pass
+                    elif message_data.get('type') == 'upload-chunk':
+                        # 接收分片并追加到临时文件
+                        try:
+                            import base64
+                            upload_id = message_data.get('upload_id')
+                            chunk_b64 = message_data.get('data', '')
+                            if not upload_id or upload_id not in upload_states:
+                                await websocket.send(json.dumps({'type': 'error', 'message': 'invalid upload_id'}))
+                                continue
+                            state = upload_states[upload_id]
+                            chunk = base64.b64decode(chunk_b64)
+                            with open(state['temp_path'], 'ab') as f:
+                                f.write(chunk)
+                            state['received'] += len(chunk)
+                            # 向前端回传进度
+                            try:
+                                await websocket.send(json.dumps({'type': 'upload-progress', 'upload_id': upload_id, 'received': state['received'], 'total': state.get('total', 0)}))
+                            except:
+                                pass
+                        except Exception as e:
+                            print(f'upload-chunk failed: {e}')
+                            try:
+                                await websocket.send(json.dumps({'type': 'error', 'message': f'upload-chunk failed: {str(e)}'}))
+                            except:
+                                pass
+                    elif message_data.get('type') == 'upload-complete':
+                        # 分片上传完成，使用 sftp 上传到远端路径并删除临时文件
+                        try:
+                            upload_id = message_data.get('upload_id')
+                            if not upload_id or upload_id not in upload_states:
+                                await websocket.send(json.dumps({'type': 'error', 'message': 'invalid upload_id'}))
+                                continue
+                            state = upload_states.pop(upload_id)
+                            temp_file = state['temp_path']
+                            filename = state['filename']
+                            remote_dir = state['remote_path']
+                            remote_path = os.path.join(remote_dir, filename)
+
+                            sftp = ssh.open_sftp()
+                            sftp.put(temp_file, remote_path)
+                            sftp.close()
+                            size = os.path.getsize(temp_file)
+                            os.remove(temp_file)
+                            # 通知前端完成
+                            try:
+                                await websocket.send(json.dumps({'type': 'upload-done', 'upload_id': upload_id, 'filename': filename, 'size': size, 'remote_path': remote_path}))
+                            except:
+                                pass
+                            # 也在远程 shell 打印提示
+                            try:
+                                shell.send(f"echo '>>> 文件 {filename} 上传成功 ({size} 字节) 到 {remote_path}'\n".encode())
+                            except:
+                                pass
+                            print(f'upload complete: {remote_path} ({size} bytes)')
+                        except Exception as e:
+                            print(f'upload-complete failed: {e}')
+                            try:
+                                await websocket.send(json.dumps({'type': 'error', 'message': f'upload-complete failed: {str(e)}'}))
+                            except:
+                                pass
+                    elif message_data.get('type') == 'upload':
+                        # 兼容旧版一次性上传
+                        try:
+                            import base64, tempfile
+                            filename = message_data.get('filename', 'file.bin')
+                            file_content = base64.b64decode(message_data.get('data', ''))
+                            temp_file = os.path.join(tempfile.gettempdir(), filename)
+                            with open(temp_file, 'wb') as f:
+                                f.write(file_content)
+                            print(f"文件已接收: {temp_file}")
+                            sftp = ssh.open_sftp()
+                            remote_path = f"/tmp/{filename}"
+                            sftp.put(temp_file, remote_path)
+                            sftp.close()
+                            os.remove(temp_file)
+                            shell.send(f"echo '>>> 文件 {filename} 上传成功 ({len(file_content)} 字节)'\n".encode())
+                            print(f"文件上传到远程: {remote_path}")
+                        except Exception as e:
+                            print(f"文件上传失败: {e}")
+                            shell.send(f"echo '>>> 文件上传失败: {str(e)}'\n".encode())
+                    elif message_data.get('type') == 'download':
+                        # 处理文件下载
+                        try:
+                            remote_file = message_data.get('filename', '')
+                            if not remote_file:
+                                print("未指定下载文件")
+                                continue
+                            
+                            sftp = ssh.open_sftp()
+                            import tempfile
+                            temp_file = os.path.join(tempfile.gettempdir(), os.path.basename(remote_file))
+                            sftp.get(remote_file, temp_file)
+                            sftp.close()
+                            
+                            # 读取文件并发送到前端
+                            with open(temp_file, 'rb') as f:
+                                file_content = f.read()
+                            
+                            import base64
+                            await websocket.send(json.dumps({
+                                'type': 'download',
+                                'filename': os.path.basename(remote_file),
+                                'data': base64.b64encode(file_content).decode('utf-8'),
+                                'size': len(file_content)
+                            }))
+                            
+                            # 清理临时文件
+                            os.remove(temp_file)
+                            
+                            print(f"文件已下载: {remote_file}")
+                        except Exception as e:
+                            print(f"文件下载失败: {e}")
+                            try:
+                                await websocket.send(json.dumps({
+                                    'type': 'error',
+                                    'message': f'文件下载失败: {str(e)}'
+                                }))
+                            except:
+                                pass
             except websockets.exceptions.ConnectionClosed:
                 print("WebSocket连接已关闭")
             except Exception as e:
@@ -234,8 +380,8 @@ async def handle_terminal(websocket):
         finally:
             # 确保SSH连接被正确关闭
             try:
-                shell.close()
-                ssh.close()
+            shell.close()
+            ssh.close()
                 print("SSH连接已关闭")
             except Exception as e:
                 print(f"关闭SSH连接时出错: {e}")
@@ -318,7 +464,7 @@ def render_html(ips, ports):
             "    html += '<tr><td>'+ip+'</td><td>'+badge(reach)+'</td><td>'+fmtLatency(lat)+'</td>'+tds+'</tr>';"
             "  }"
             "  tbody.innerHTML=html;"
-            "  const sum=document.getElementById('summary');sum.textContent=`总计 ${total} | 可达 ${okc} | 不可达 ${failc}`;"
+            "  const sum=document.getElementById('summary');sum.textContent='总计 '+total+' | 可达 '+okc+' | 不可达 '+failc;"
             "}"
             "fetchStatus();setInterval(fetchStatus, Math.max(3000,(data.interval||5)*1000));"
             "</script>"
@@ -350,7 +496,7 @@ class Handler(BaseHTTPRequestHandler):
             password = (q.get('password') or [''])[0] or 'Databuff@123'
             # 使用f-string并转义所有大括号，避免CSS/JS大括号被误解为占位符
             ws_port = getattr(self.server, 'ws_port', self.server.server_port)
-            html = f"""
+            html = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -487,6 +633,148 @@ class Handler(BaseHTTPRequestHandler):
             background: #991b1b;
             border-color: #b91c1c;
         }}
+        .menu-item.file-btn {{
+            background: #1e40af;
+            border: 1px solid #1e3a8a;
+            color: #93c5fd;
+            cursor: pointer;
+            text-align: center;
+            padding: 6px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        }}
+        .menu-item.file-btn:hover {{
+            background: #1e3a8a;
+            border-color: #1e40af;
+        }}
+        #upload-input {{
+            display: none;
+        }}
+        #download-modal {{
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            padding: 20px;
+            z-index: 1000;
+            min-width: 300px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+        }}
+        #download-modal.show {{
+            display: block;
+        }}
+        #download-modal input {{
+            width: 100%;
+            padding: 6px 8px;
+            background: #0b1220;
+            border: 1px solid #203049;
+            border-radius: 4px;
+            color: #e2e8f0;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+        }}
+        #download-modal button {{
+            background: #1e40af;
+            color: #93c5fd;
+            border: 1px solid #1e3a8a;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 5px;
+            font-size: 12px;
+        }}
+        #download-modal button:hover {{
+            background: #1e3a8a;
+        }}
+        #download-modal-backdrop {{
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 999;
+        }}
+        #download-modal-backdrop.show {{
+            display: block;
+        }}
+        /* 上传进度模态 */
+        #upload-modal-backdrop {{
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 1005;
+        }}
+        #upload-modal {{
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #0f172a;
+            border: 1px solid #1f2937;
+            padding: 14px;
+            border-radius: 8px;
+            color: #e2e8f0;
+            z-index: 1006;
+            min-width: 320px;
+        }}
+        #upload-modal .progress-bar {{
+            width: 100%;
+            height: 12px;
+            background: #0b1220;
+            border: 1px solid #203049;
+            border-radius: 6px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }}
+        #upload-modal .progress-bar > i {{
+            display: block;
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg,#4f46e5,#06b6d4);
+        }}
+        #upload-modal .meta {{
+            font-size: 12px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+        }}
+        /* 连接失败提示横幅 */
+        #connection-banner {{
+            display: none;
+            position: fixed;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #7f1d1d;
+            color: #ffd4d4;
+            border: 1px solid #991b1b;
+            padding: 8px 12px;
+            border-radius: 6px;
+            z-index: 1100;
+            font-size: 13px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+        }}
+        #connection-banner button {{
+            margin-left: 10px;
+            background: transparent;
+            border: 1px solid #ffd4d4;
+            color: #ffd4d4;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/xterm@4.14.1/lib/xterm.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@4.14.1/css/xterm.css">
@@ -504,18 +792,44 @@ class Handler(BaseHTTPRequestHandler):
         </div>
         <div class="menu-item action-btn" id="reconnect-btn">✓ 确认连接</div>
         
+        <div class="menu-item label">文件传输</div>
+        <div class="menu-item">
+            <input type="text" id="upload-remote-path" placeholder="远端目标路径，例如: /tmp" />
+        </div>
+        <div class="menu-item file-btn" id="upload-btn">↑ 上传文件</div>
+        <div class="menu-item file-btn" id="download-btn">↓ 下载文件</div>
+        
         <div class="menu-item label">操作</div>
         <div class="menu-item close-btn" id="close-btn">✕ 关闭终端</div>
     </div>
+    
+    <!-- 文件上传 input (隐藏) -->
+    <input type="file" id="upload-input" />
+    <!-- 上传进度模态 -->
+    <div id="upload-modal-backdrop"></div>
+    <div id="upload-modal">
+        <div class="meta" id="upload-meta">准备上传</div>
+        <div class="progress-bar"><i id="upload-progress-bar"></i></div>
+        <div style="text-align:right;"><button id="upload-cancel" style="background:#7f1d1d;color:#ffd4d4;border:1px solid #991b1b;padding:6px 8px;border-radius:4px;cursor:pointer;">取消</button></div>
+    </div>
+    
+    <!-- 文件下载对话框 -->
+    <div id="download-modal-backdrop"></div>
+    <div id="download-modal">
+        <div style="margin-bottom: 10px; color: #e2e8f0;">请输入要下载的文件路径</div>
+        <input type="text" id="download-filepath" placeholder="例如: /tmp/file.txt" />
+        <button id="download-confirm">确认</button>
+        <button id="download-cancel">取消</button>
+    </div>
 
+    <!-- 连接状态横幅（连接失败时显示，点击可打开更换密码） -->
+    <div id="connection-banner">连接失败 — <button id="connection-banner-open">更换密码</button></div>
     <div id="terminal-container"></div>
     <script>
-        console.log('Terminal script started');
-        
         const encoder = new TextEncoder();
         
         // 使用简单的计算方法，而不是依赖 proposeGeometry
-        function calculateTerminalSize() {{
+        function calculateTerminalSize() {
             const container = document.getElementById('terminal-container');
             // 根据容器大小和字体大小估算
             // Consolas 14px: 字符宽度约 8.4px，字符高度约 17px
@@ -528,60 +842,48 @@ class Handler(BaseHTTPRequestHandler):
             const cols = Math.floor(containerWidth / charWidth);
             const rows = Math.floor(containerHeight / charHeight);
             
-            console.log('Container size:', containerWidth, 'x', containerHeight);
-            console.log('Calculated terminal size:', cols, 'x', rows);
-            
-            return {{
+            return {
                 cols: Math.max(Math.min(cols, 200), 80),
                 rows: Math.max(Math.min(rows, 100), 24)
-            }};
-        }}
+            };
+        }
         
         const size = calculateTerminalSize();
-        console.log('Terminal size:', size);
         
-        const term = new Terminal({{
+        const term = new Terminal({
             fontFamily: 'Consolas, Monaco, "Courier New", monospace',
             fontSize: 14,
             cursorBlink: true,
             scrollback: 10000,
             cols: size.cols,
             rows: size.rows
-        }});
-        console.log('Terminal created');
-        
+        });
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
-        console.log('FitAddon loaded');
         
         const container = document.getElementById('terminal-container');
         term.open(container);
-        console.log('Terminal opened');
         
         // 打开后立即调整大小
         fitAddon.fit();
-        console.log('Terminal fitted');
         
         // 使用计算的大小作为参数（proposeGeometry 可能不可用）
         const actualGeometry = {{
             cols: size.cols,
             rows: size.rows
         }};
-        console.log('Terminal size:', actualGeometry);
         
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = wsProtocol + '//' + window.location.hostname + ':{ws_port}/';
-        console.log('WebSocket URL:', wsUrl);
+        const wsUrl = wsProtocol + '//' + window.location.hostname + ':__WS_PORT__/';
         
         const params = {{ 
-            ip: "{ip}", 
-            port: {port}, 
-            user: "{user}", 
-            password: "{password}",
+            ip: "__IP__", 
+            port: __PORT__, 
+            user: "__USER__", 
+            password: "__PASSWORD__",
             cols: actualGeometry.cols || size.cols,
             rows: actualGeometry.rows || size.rows
         }};
-        console.log('Params:', params);
         
         let ws = new WebSocket(wsUrl);
         let wsConnected = false;
@@ -589,8 +891,11 @@ class Handler(BaseHTTPRequestHandler):
         let lastContextClick = 0;
 
         ws.onopen = () => {{
-            console.log('WebSocket connected');
             wsConnected = true;
+            try {{
+                const banner = document.getElementById('connection-banner');
+                if (banner) banner.style.display = 'none';
+            }} catch (e) {{}}
             ws.send(JSON.stringify(params));
         }};
 
@@ -601,6 +906,60 @@ class Handler(BaseHTTPRequestHandler):
                     const bytes = Uint8Array.from(atob(data.data), c => c.charCodeAt(0));
                     let decoded = decoder.decode(bytes, {{ stream: true }});
                     term.write(decoded.replace(/\\x00/g, ''));
+                }} else if (data.type === 'download') {{
+                    // 处理文件下载
+                    try {{
+                        const filename = data.filename;
+                        const fileData = atob(data.data);
+                        const bytes = new Uint8Array(fileData.length);
+                        for (let i = 0; i < fileData.length; i++) {{
+                            bytes[i] = fileData.charCodeAt(i);
+                        }}
+                        
+                        const blob = new Blob([bytes], {{ type: 'application/octet-stream' }});
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.download = filename;
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        URL.revokeObjectURL(url);
+                        
+                        term.write(`\\r\\n>>> 文件已下载: ${{filename}} (${{data.size}} 字节)\\r\\n`);
+                    }} catch (err) {{
+                        console.error('文件下载处理失败:', err);
+                        term.write(`\\r\\n>>> 下载失败: ${{err.message}}\\r\\n`);
+                    }}
+                }} else if (data.type === 'upload-progress') {{
+                    try {{
+                        const id = data.upload_id;
+                        const received = data.received || 0;
+                        const total = data.total || 0;
+                        const pct = total ? Math.floor((received/total)*100) : 0;
+                        const progressBar = document.getElementById('upload-progress-bar');
+                        const uploadModal = document.getElementById('upload-modal');
+                        const uploadBackdrop = document.getElementById('upload-modal-backdrop');
+                        const uploadMeta = document.getElementById('upload-meta');
+                        if (progressBar) progressBar.style.width = pct + '%';
+                        if (uploadMeta) uploadMeta.textContent = `上传中: ${{id}} (${{pct}}%)`;
+                        if (pct >= 100) {{ if (uploadModal) uploadModal.style.display = 'none'; if (uploadBackdrop) uploadBackdrop.style.display = 'none'; }}
+                    }} catch (err) {{ console.error('upload-progress handle failed', err); }}
+                }} else if (data.type === 'upload-done') {{
+                    try {{
+                        const filename = data.filename;
+                        const size = data.size;
+                        const remote = data.remote_path || '';
+                        const progressBar = document.getElementById('upload-progress-bar');
+                        const uploadModal = document.getElementById('upload-modal');
+                        const uploadBackdrop = document.getElementById('upload-modal-backdrop');
+                        if (progressBar) progressBar.style.width = '100%';
+                        if (uploadModal) uploadModal.style.display = 'none';
+                        if (uploadBackdrop) uploadBackdrop.style.display = 'none';
+                        term.write(`\\r\\n>>> 文件上传完成: ${{filename}} (${{size}} 字节) 到 ${{remote}}\\r\\n`);
+                    }} catch (err) {{ console.error('upload-done handle failed', err); }}
+                }} else if (data.type === 'upload-ack') {{
+                    // 上传确认
                 }} else if (data.type === 'error') {{
                     term.write('\\r\\n' + (data.message || data.error || '错误') + '\\r\\n');
                 }}
@@ -611,38 +970,115 @@ class Handler(BaseHTTPRequestHandler):
 
         ws.onerror = (error) => {{
             console.error('WebSocket error:', error);
-            term.write('\\r\\n连接出错\\r\\n');
+            term.write('\r\n连接出错\r\n');
+            try {{
+                const banner = document.getElementById('connection-banner');
+                if (banner) banner.style.display = 'block';
+            }} catch (e) {{}}
         }};
-        
+
         ws.onclose = (event) => {{
-            console.log('WebSocket closed:', event);
+            try {{
+                const banner = document.getElementById('connection-banner');
+                if (banner && event && event.code !== 1000) banner.style.display = 'block';
+            }} catch (e) {{}}
             if (event.code === 1000) {{
                 // 正常关闭
             }} else {{
-                term.write('\\r\\n会话已超时或已关闭\\r\\n');
+                term.write('\r\n会话已超时或已关闭\r\n');
             }}
         }};
 
+        // 将 Uint8Array 转为 base64 的安全方法（避免 apply 限制）
+        function bytesToBase64(uint8arr) {{
+            let CHUNK_SIZE = 0x8000;
+            let index = 0;
+            let length = uint8arr.length;
+            let result = '';
+            let slice;
+            while (index < length) {{
+                slice = uint8arr.subarray(index, Math.min(index + CHUNK_SIZE, length));
+                result += String.fromCharCode.apply(null, slice);
+                index += CHUNK_SIZE;
+            }}
+            return btoa(result);
+        }}
+
         function sendTerminalData(text) {{
-            if (!wsConnected || !ws || !text) return;
+            if (!wsConnected || !ws || text === undefined || text === null) return;
             try {{
                 const bytes = encoder.encode(text);
-                const b64 = btoa(String.fromCharCode.apply(null, bytes));
+                const b64 = bytesToBase64(bytes);
                 ws.send(JSON.stringify({{ type: 'data', data: b64 }}));
             }} catch (e) {{
                 console.error('发送终端数据失败:', e);
             }}
         }}
 
-        term.onData(data => {{
-            sendTerminalData(data);
+        // 使用 onKey 捕获所有按键（包括方向键、组合键），提高兼容性
+        term.onKey(e => {{
+            try {{
+                const key = e.key || '';
+                sendTerminalData(key);
+            }} catch (err) {{
+                console.error('onKey 发送失败:', err);
+            }}
         }});
 
-        // 选中即复制
+        // 支持全局粘贴（例如 mac 的两指触控板粘贴或 Cmd+V）
+        document.addEventListener('paste', (ev) => {{
+            try {{
+                const clipboardData = ev.clipboardData || window.clipboardData;
+                const text = clipboardData.getData('text');
+                if (text) {{
+                    sendTerminalData(text);
+                }}
+            }} catch (err) {{
+                console.error('粘贴事件处理失败:', err);
+            }}
+        }});
+
+        async function writeClipboard(text) {{
+            if (!text) return;
+            if (navigator.clipboard && window.isSecureContext) {{
+                try {{
+                    await navigator.clipboard.writeText(text);
+                    return;
+                }} catch (e) {{}}
+            }}
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            textarea.style.pointerEvents = 'none';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            try {{
+                document.execCommand('copy');
+            }} catch (e) {{
+                console.error('复制失败:', e);
+            }} finally {{
+                document.body.removeChild(textarea);
+            }}
+        }}
+
+        async function readClipboard() {{
+            if (navigator.clipboard && navigator.clipboard.readText) {{
+                try {{
+                    const text = await navigator.clipboard.readText();
+                    if (text) return text;
+                }} catch (e) {{}}
+            }}
+            // 无法访问剪贴板时静默失败，交给系统快捷键 Ctrl+V / Cmd+V 处理
+            return '';
+        }}
+
+        // 选中即复制（兼容非安全上下文）
         term.onSelectionChange(() => {{
             const selection = term.getSelection();
             if (selection) {{
-                navigator.clipboard.writeText(selection).catch(() => {{}});
+                writeClipboard(selection);
             }}
         }});
 
@@ -653,7 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
             if (now - lastContextClick <= 1000) {{
                 lastContextClick = 0;
                 try {{
-                    const text = await navigator.clipboard.readText();
+                    const text = await readClipboard();
                     if (text) {{
                         sendTerminalData(text);
                     }}
@@ -684,6 +1120,15 @@ class Handler(BaseHTTPRequestHandler):
                 menuContainer.classList.remove('show');
             }}
         }});
+
+        // 连接失败横幅按钮：快速打开更换密码菜单
+        const bannerOpenBtn = document.getElementById('connection-banner-open');
+        if (bannerOpenBtn) {{
+            bannerOpenBtn.addEventListener('click', () => {{
+                menuContainer.classList.add('show');
+                passwordInput.focus();
+            }});
+        }}
 
         // 重新连接功能
         reconnectBtn.addEventListener('click', () => {{
@@ -721,6 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
                 
                 ws.onopen = () => {{
                     wsConnected = true;
+                    try {{ const banner = document.getElementById('connection-banner'); if (banner) banner.style.display = 'none'; }} catch (e) {{}}
                     ws.send(JSON.stringify(newParams));
                     menuContainer.classList.remove('show');
                     passwordInput.value = '';
@@ -734,6 +1180,60 @@ class Handler(BaseHTTPRequestHandler):
                             const bytes = Uint8Array.from(atob(data.data), c => c.charCodeAt(0));
                             let decoded = decoder.decode(bytes, {{ stream: true }});
                             term.write(decoded.replace(/\\x00/g, ''));
+                        }} else if (data.type === 'download') {{
+                            // 处理文件下载
+                            try {{
+                                const filename = data.filename;
+                                const fileData = atob(data.data);
+                                const bytes = new Uint8Array(fileData.length);
+                                for (let i = 0; i < fileData.length; i++) {{
+                                    bytes[i] = fileData.charCodeAt(i);
+                                }}
+                                
+                                const blob = new Blob([bytes], {{ type: 'application/octet-stream' }});
+                                const url = URL.createObjectURL(blob);
+                                const link = document.createElement('a');
+                                link.href = url;
+                                link.download = filename;
+                                document.body.appendChild(link);
+                                link.click();
+                                document.body.removeChild(link);
+                                URL.revokeObjectURL(url);
+                                
+                                term.write(`\\r\\n>>> 文件已下载: ${{filename}} (${{data.size}} 字节)\\r\\n`);
+                            }} catch (err) {{
+                                console.error('文件下载处理失败:', err);
+                                term.write(`\\r\\n>>> 下载失败: ${{err.message}}\\r\\n`);
+                            }}
+                        }} else if (data.type === 'upload-progress') {{
+                            try {{
+                                const id = data.upload_id;
+                                const received = data.received || 0;
+                                const total = data.total || 0;
+                                const pct = total ? Math.floor((received/total)*100) : 0;
+                                const progressBar = document.getElementById('upload-progress-bar');
+                                const uploadModal = document.getElementById('upload-modal');
+                                const uploadBackdrop = document.getElementById('upload-modal-backdrop');
+                                const uploadMeta = document.getElementById('upload-meta');
+                                if (progressBar) progressBar.style.width = pct + '%';
+                                if (uploadMeta) uploadMeta.textContent = `上传中: ${{id}} (${{pct}}%)`;
+                                if (pct >= 100) {{ if (uploadModal) uploadModal.style.display = 'none'; if (uploadBackdrop) uploadBackdrop.style.display = 'none'; }}
+                            }} catch (err) {{ console.error('upload-progress handle failed', err); }}
+                        }} else if (data.type === 'upload-done') {{
+                            try {{
+                                const filename = data.filename;
+                                const size = data.size;
+                                const remote = data.remote_path || '';
+                                const progressBar = document.getElementById('upload-progress-bar');
+                                const uploadModal = document.getElementById('upload-modal');
+                                const uploadBackdrop = document.getElementById('upload-modal-backdrop');
+                                if (progressBar) progressBar.style.width = '100%';
+                                if (uploadModal) uploadModal.style.display = 'none';
+                                if (uploadBackdrop) uploadBackdrop.style.display = 'none';
+                                term.write(`\\r\\n>>> 文件上传完成: ${{filename}} (${{size}} 字节) 到 ${{remote}}\\r\\n`);
+                            }} catch (err) {{ console.error('upload-done handle failed', err); }}
+                        }} else if (data.type === 'upload-ack') {{
+                            // 上传确认
                         }} else if (data.type === 'error') {{
                             term.write('\\r\\n' + (data.message || data.error || '错误') + '\\r\\n');
                         }}
@@ -742,15 +1242,17 @@ class Handler(BaseHTTPRequestHandler):
                     }}
                 }};
 
-                ws.onerror = (error) => {{
-                    term.write('\\r\\n连接失败，请检查密码\\r\\n');
-                }};
-                
-                ws.onclose = (event) => {{
-                    if (!event.wasClean) {{
-                        term.write('\\r\\n会话已超时或已关闭\\r\\n');
-                    }}
-                }};
+                    ws.onerror = (error) => {{
+                        term.write('\\r\\n连接失败，请检查密码\\r\\n');
+                        try {{ const banner = document.getElementById('connection-banner'); if (banner) banner.style.display = 'block'; }} catch (e) {{}}
+                    }};
+
+                    ws.onclose = (event) => {{
+                        try {{ const banner = document.getElementById('connection-banner'); if (banner && event && event.code !== 1000) banner.style.display = 'block'; }} catch (e) {{}}
+                        if (!event.wasClean) {{
+                            term.write('\\r\\n会话已超时或已关闭\\r\\n');
+                        }}
+                    }};
             }}, 200);
         }});
 
@@ -764,6 +1266,143 @@ class Handler(BaseHTTPRequestHandler):
             setTimeout(() => {{
                 window.location.href = '/';
             }}, 500);
+        }});
+
+        // 文件上传功能
+        const uploadBtn = document.getElementById('upload-btn');
+        const uploadInput = document.getElementById('upload-input');
+        
+        uploadBtn.addEventListener('click', () => {{
+            uploadInput.click();
+        }});
+        
+        uploadInput.addEventListener('change', async (e) => {{
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const remotePathInput = document.getElementById('upload-remote-path');
+            const remotePath = (remotePathInput && remotePathInput.value.trim()) || '/tmp';
+
+            term.write(`\\r\\n>>> 准备上传: ${{file.name}} -> ${{remotePath}}\\r\\n`);
+
+            const uploadModal = document.getElementById('upload-modal');
+            const uploadBackdrop = document.getElementById('upload-modal-backdrop');
+            const progressBar = document.getElementById('upload-progress-bar');
+            const uploadMeta = document.getElementById('upload-meta');
+            const uploadCancelBtn = document.getElementById('upload-cancel');
+
+            let cancelled = false;
+            uploadCancelBtn.onclick = () => {{ cancelled = true; uploadModal.style.display = 'none'; uploadBackdrop.style.display = 'none'; term.write(`\\r\\n>>> 已取消上传\\r\\n`); }};
+
+            uploadMeta.textContent = `正在处理中: ${{file.name}}`;
+            progressBar.style.width = '0%';
+            uploadBackdrop.style.display = 'block';
+            uploadModal.style.display = 'block';
+
+            const reader = new FileReader();
+            reader.onload = async (event) => {{
+                try {{
+                    const arrayBuffer = event.target.result;
+                    const total = arrayBuffer.byteLength;
+                    const upload_id = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,8);
+
+                    // 发送 init
+                    if (!(wsConnected && ws && ws.readyState === WebSocket.OPEN)) {{
+                        term.write('\\r\\n>>> WebSocket 未连接，无法上传\\r\\n');
+                        uploadModal.style.display = 'none'; uploadBackdrop.style.display = 'none';
+                        return;
+                    }}
+                    ws.send(JSON.stringify({{ type: 'upload-init', upload_id: upload_id, filename: file.name, size: total, remote_path: remotePath }}));
+
+                    const CHUNK_SIZE = 64 * 1024; // 64KB
+                    let offset = 0;
+                    let index = 0;
+                    while (offset < total) {{
+                        if (cancelled) break;
+                        const end = Math.min(offset + CHUNK_SIZE, total);
+                        const chunk = new Uint8Array(arrayBuffer.slice(offset, end));
+                        const b64 = bytesToBase64(chunk);
+                        ws.send(JSON.stringify({{ type: 'upload-chunk', upload_id: upload_id, index: index, data: b64 }}));
+                        offset = end;
+                        index += 1;
+                        const percent = Math.floor((offset / total) * 100);
+                        progressBar.style.width = percent + '%';
+                        uploadMeta.textContent = `上传中: ${{file.name}} (${{percent}}%)`;
+                        // 短暂等待，避免阻塞 UI
+                        await new Promise(r => setTimeout(r, 20));
+                    }}
+
+                    if (!cancelled) {{
+                        ws.send(JSON.stringify({{ type: 'upload-complete', upload_id: upload_id }}));
+                    }} else {{
+                        // 如果取消，通知后端（可选）
+                        try {{ ws.send(JSON.stringify({{ type: 'upload-cancel', upload_id: upload_id }})); }} catch(e){{}}
+                    }}
+
+                    // 等待服务器响应 upload-done 更新（由 ws.onmessage 处理）
+                }} catch (err) {{
+                    console.error('上传失败:', err);
+                    term.write(`\\r\\n>>> 上传失败: ${{err.message}}\\r\\n`);
+                    uploadModal.style.display = 'none'; uploadBackdrop.style.display = 'none';
+                }}
+            }};
+            reader.readAsArrayBuffer(file);
+
+            // 清空 input，以便再次选择同一文件
+            uploadInput.value = '';
+        }});
+        
+        // 文件下载功能
+        const downloadBtn = document.getElementById('download-btn');
+        const downloadModal = document.getElementById('download-modal');
+        const downloadModalBackdrop = document.getElementById('download-modal-backdrop');
+        const downloadFilepath = document.getElementById('download-filepath');
+        const downloadConfirm = document.getElementById('download-confirm');
+        const downloadCancel = document.getElementById('download-cancel');
+        
+        downloadBtn.addEventListener('click', () => {{
+            downloadModal.classList.add('show');
+            downloadModalBackdrop.classList.add('show');
+            downloadFilepath.focus();
+        }});
+        
+        downloadCancel.addEventListener('click', () => {{
+            downloadModal.classList.remove('show');
+            downloadModalBackdrop.classList.remove('show');
+            downloadFilepath.value = '';
+        }});
+        
+        downloadModalBackdrop.addEventListener('click', () => {{
+            downloadModal.classList.remove('show');
+            downloadModalBackdrop.classList.remove('show');
+            downloadFilepath.value = '';
+        }});
+        
+        downloadConfirm.addEventListener('click', () => {{
+            const filepath = downloadFilepath.value.trim();
+            if (!filepath) {{
+                alert('请输入文件路径');
+                downloadFilepath.focus();
+                return;
+            }}
+            
+            if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {{
+                ws.send(JSON.stringify({{
+                    type: 'download',
+                    filename: filepath
+                }}));
+            }}
+            
+            downloadModal.classList.remove('show');
+            downloadModalBackdrop.classList.remove('show');
+            downloadFilepath.value = '';
+            term.write(`\\r\\n>>> 正在下载文件: ${{filepath}}...\\r\\n`);
+        }});
+        
+        downloadFilepath.addEventListener('keypress', (e) => {{
+            if (e.key === 'Enter') {{
+                downloadConfirm.click();
+            }}
         }});
 
         // 回车键快速提交密码
@@ -803,8 +1442,6 @@ class Handler(BaseHTTPRequestHandler):
                 lastResizeCols = geometry.cols;
                 lastResizeRows = geometry.rows;
                 
-                console.log('终端大小已改变: ' + geometry.cols + 'x' + geometry.rows);
-                
                 if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {{
                     ws.send(JSON.stringify({{ 
                         type: 'resize', 
@@ -816,11 +1453,22 @@ class Handler(BaseHTTPRequestHandler):
         }});
         
         term.focus();
-        console.log('Terminal initialization complete');
     </script>
 </body>
 </html>
 """
+            # 将模板中用于转义的大括号还原为单大括号，
+            # 这样 `${{var}}` 等会变为正确的 `${var}`，避免 JS 语法错误
+            html = html.replace('{{', '{').replace('}}', '}')
+            # 填充占位符为实际值，避免在 HTML 中使用 f-string 导致大量大括号需要转义
+            html = html.replace('__WS_PORT__', str(ws_port))
+            html = html.replace('__IP__', ip)
+            html = html.replace('__PORT__', str(port))
+            html = html.replace('__USER__', user)
+            html = html.replace('__PASSWORD__', password)
+
+            # (已移除) 不再在服务器端写出调试 HTML 快照
+
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.send_header('Content-Length', str(len(html.encode())))
